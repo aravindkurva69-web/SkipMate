@@ -1,0 +1,415 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          P=SkipMate
+          J=$P/app/src/main/java/com/skipmate/app
+          R=$P/app/src/main/res
+          mkdir -p $J $R/xml $R/layout $R/values $R/drawable $R/mipmap-anydpi-v26
+
+          cat > $P/settings.gradle.kts <<'XEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "SkipMate"
+          include(":app")
+          XEOF
+
+          cat > $P/build.gradle.kts <<'XEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          XEOF
+
+          cat > $P/gradle.properties <<'XEOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          XEOF
+
+          cat > $P/app/build.gradle.kts <<'XEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.skipmate.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.skipmate.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          XEOF
+
+          cat > $P/app/src/main/AndroidManifest.xml <<'XEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.SkipMate">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".SkipAccessibilityService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          XEOF
+
+          cat > $R/xml/accessibility_service_config.xml <<'XEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowContentChanged|typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/service_description"
+              android:notificationTimeout="100"
+              android:packageNames="com.google.android.youtube,com.google.android.apps.youtube.music"
+              android:settingsActivity="com.skipmate.app.MainActivity" />
+          XEOF
+
+          cat > $J/Prefs.kt <<'XEOF'
+          package com.skipmate.app
+
+          import android.content.Context
+
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("skipmate_prefs", Context.MODE_PRIVATE)
+              fun isEnabled(c: Context): Boolean = sp(c).getBoolean("enabled", true)
+              fun setEnabled(c: Context, v: Boolean) { sp(c).edit().putBoolean("enabled", v).apply() }
+              fun skippedCount(c: Context): Int = sp(c).getInt("count", 0)
+              fun incrementSkipped(c: Context) { sp(c).edit().putInt("count", skippedCount(c) + 1).apply() }
+              fun resetCount(c: Context) { sp(c).edit().putInt("count", 0).apply() }
+          }
+          XEOF
+
+          cat > $J/SkipAccessibilityService.kt <<'XEOF'
+          package com.skipmate.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.SystemClock
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class SkipAccessibilityService : AccessibilityService() {
+
+              private var lastScan = 0L
+              private var lastClick = 0L
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null || !Prefs.isEnabled(this)) return
+                  val pkg = event.packageName?.toString() ?: return
+                  if (pkg !in YOUTUBE_PACKAGES) return
+
+                  val now = SystemClock.elapsedRealtime()
+                  if (now - lastScan < 150L) return
+                  lastScan = now
+
+                  val root = rootInActiveWindow ?: return
+                  val button = findSkipButton(root) ?: return
+                  if (now - lastClick < 1000L) return
+                  if (clickNode(button)) {
+                      lastClick = now
+                      Prefs.incrementSkipped(this)
+                  }
+              }
+
+              override fun onInterrupt() {}
+
+              private fun findSkipButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  for (pkg in YOUTUBE_PACKAGES) {
+                      for (id in SKIP_VIEW_IDS) {
+                          val hits = root.findAccessibilityNodeInfosByViewId(pkg + ":id/" + id)
+                          hits?.firstOrNull { it.isVisibleToUser }?.let { return it }
+                      }
+                  }
+                  for (label in SKIP_LABEL_QUERIES) {
+                      val hits = root.findAccessibilityNodeInfosByText(label)
+                      hits?.firstOrNull { it.isVisibleToUser && matchesSkipLabel(it) }?.let { return it }
+                  }
+                  return null
+              }
+
+              private fun matchesSkipLabel(node: AccessibilityNodeInfo): Boolean {
+                  val text = (node.text ?: node.contentDescription)?.toString()?.trim() ?: return false
+                  return SKIP_LABEL_REGEX.matches(text)
+              }
+
+              private fun clickNode(node: AccessibilityNodeInfo): Boolean {
+                  var current: AccessibilityNodeInfo? = node
+                  var depth = 0
+                  while (current != null && depth < 5) {
+                      if (current.isClickable && current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                          return true
+                      }
+                      current = current.parent
+                      depth++
+                  }
+                  val r = Rect()
+                  node.getBoundsInScreen(r)
+                  if (r.isEmpty) return false
+                  return tap(r.exactCenterX(), r.exactCenterY())
+              }
+
+              private fun tap(x: Float, y: Float): Boolean {
+                  val path = Path().apply { moveTo(x, y) }
+                  val stroke = GestureDescription.StrokeDescription(path, 0, 50)
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  return dispatchGesture(gesture, null, null)
+              }
+
+              companion object {
+                  private val YOUTUBE_PACKAGES = setOf(
+                      "com.google.android.youtube",
+                      "com.google.android.apps.youtube.music"
+                  )
+                  private val SKIP_VIEW_IDS = listOf(
+                      "skip_ad_button",
+                      "skip_ad_button_container",
+                      "modern_skip_button",
+                      "skip_button"
+                  )
+                  private val SKIP_LABEL_QUERIES = listOf("Skip ad", "Skip Ads", "Skip")
+                  private val SKIP_LABEL_REGEX =
+                      Regex("^skip(\\s+ads?)?(\\s+\\d+.*)?$", RegexOption.IGNORE_CASE)
+              }
+          }
+          XEOF
+
+          cat > $J/MainActivity.kt <<'XEOF'
+          package com.skipmate.app
+
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.appcompat.widget.SwitchCompat
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var status: TextView
+              private lateinit var count: TextView
+              private lateinit var toggle: SwitchCompat
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+                  status = findViewById(R.id.statusText)
+                  count = findViewById(R.id.countText)
+                  toggle = findViewById(R.id.enableSwitch)
+
+                  toggle.setOnCheckedChangeListener { _, checked -> Prefs.setEnabled(this, checked) }
+
+                  findViewById<Button>(R.id.openSettingsButton).setOnClickListener {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  findViewById<Button>(R.id.appInfoButton).setOnClickListener {
+                      val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                      i.data = Uri.fromParts("package", packageName, null)
+                      startActivity(i)
+                  }
+                  findViewById<Button>(R.id.resetButton).setOnClickListener {
+                      Prefs.resetCount(this)
+                      refresh()
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              private fun refresh() {
+                  toggle.isChecked = Prefs.isEnabled(this)
+                  status.setText(if (isServiceEnabled()) R.string.status_on else R.string.status_off)
+                  count.text = getString(R.string.skipped_count, Prefs.skippedCount(this))
+              }
+
+              private fun isServiceEnabled(): Boolean {
+                  val cn = ComponentName(this, SkipAccessibilityService::class.java)
+                  val enabled = Settings.Secure.getString(
+                      contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  return enabled.split(':').any {
+                      it.equals(cn.flattenToString(), true) || it.equals(cn.flattenToShortString(), true)
+                  }
+              }
+          }
+          XEOF
+
+          cat > $R/layout/activity_main.xml <<'XEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent">
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="24dp">
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="@string/app_name"
+                      android:textSize="32sp"
+                      android:textStyle="bold" />
+                  <TextView
+                      android:id="@+id/statusText"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:textSize="18sp" />
+                  <TextView
+                      android:id="@+id/countText"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:textSize="16sp" />
+                  <androidx.appcompat.widget.SwitchCompat
+                      android:id="@+id/enableSwitch"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="24dp"
+                      android:text="@string/auto_skip_label" />
+                  <Button
+                      android:id="@+id/openSettingsButton"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="24dp"
+                      android:text="@string/open_accessibility" />
+                  <Button
+                      android:id="@+id/appInfoButton"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="@string/open_app_info" />
+                  <Button
+                      android:id="@+id/resetButton"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="@string/reset_count" />
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="24dp"
+                      android:text="@string/help_text"
+                      android:textSize="14sp" />
+              </LinearLayout>
+          </ScrollView>
+          XEOF
+
+          cat > $R/values/strings.xml <<'XEOF'
+          <resources>
+              <string name="app_name">SkipMate</string>
+              <string name="service_description">Automatically taps the Skip ad button in YouTube when it appears. Reads only the YouTube screen, stores nothing, no internet access.</string>
+              <string name="status_on">Service: ON</string>
+              <string name="status_off">Service: OFF - enable it in Accessibility settings</string>
+              <string name="skipped_count">Ads skipped: %1$d</string>
+              <string name="auto_skip_label">Auto-skip ads</string>
+              <string name="open_accessibility">Open Accessibility settings</string>
+              <string name="open_app_info">Open app info (restricted settings)</string>
+              <string name="reset_count">Reset counter</string>
+              <string name="help_text">Setup: tap Open Accessibility settings, find SkipMate under Installed or Downloaded apps, and turn it on. If it is greyed out on Android 13 or newer, open app info, tap the three dots and choose Allow restricted settings, then try again. Only skippable ads are skipped.</string>
+          </resources>
+          XEOF
+
+          cat > $R/values/colors.xml <<'XEOF'
+          <resources>
+              <color name="ic_launcher_background">#D32F2F</color>
+          </resources>
+          XEOF
+
+          cat > $R/values/themes.xml <<'XEOF'
+          <resources>
+              <style name="Theme.SkipMate" parent="Theme.AppCompat.DayNight.NoActionBar" />
+          </resources>
+          XEOF
+
+          cat > $R/drawable/ic_launcher_foreground.xml <<'XEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#FFFFFF" android:pathData="M36,34 L36,74 L62,54 Z" />
+              <path android:fillColor="#FFFFFF" android:pathData="M64,34 H72 V74 H64 Z" />
+          </vector>
+          XEOF
+
+          cat > $R/mipmap-anydpi-v26/ic_launcher.xml <<'XEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          XEOF
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+        working-directory: SkipMate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SkipMate-APK
+          path: SkipMate/app/build/outputs/apk/debug/app-debug.apk
